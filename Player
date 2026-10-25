@@ -1,0 +1,278 @@
+
+extends CharacterBody3D
+
+const WALK_SPEED = 5.5
+const SPRINT_SPEED = 8.5
+const CLIMB_SPEED = 3.2
+const JUMP_VELOCITY = 4.5
+const MOUSE_SENSITIVITY = 0.0025
+
+var gravity = ProjectSettings.get_setting("physics/3d/default_gravity")
+var on_ladder: bool = false
+var in_van: bool = false
+var in_minigame: bool = false
+var current_van: Node3D = null
+var active_item: Dictionary = {}
+var interact_cooldown: float = 0.0
+var speed_boost: float = 1.0
+
+var cash: int = 150
+var active_job: String = "STANDBY (Answer HQ Phone)"
+
+var stock: Dictionary = {
+	"Alarm": 1,
+	"Bell": 1,
+	"CCTV": 1
+}
+
+@onready var head: Node3D = $Head
+@onready var camera: Camera3D = $Head/Camera3D
+@onready var head_torch: SpotLight3D = $Head/Camera3D/HeadTorch
+
+var prompt_label: Label
+var hud_label: Label
+var stock_label: Label
+var toast_label: Label
+
+var minigame_panel: Panel
+var mg_title: Label
+var mg_status: Label
+var mg_buttons: Array = []
+var mg_step: int = 0
+var mg_house_num: int = -1
+var mg_job_key: String = ""
+var mg_status_mesh: MeshInstance3D = null
+
+var job_step_texts: Dictionary = {
+	"Alarm": [
+		"1. Enter Engineer Code (9999) & Silence Internal Sounder",
+		"2. Swap Faulty 12V 7Ah SLA Backup Battery",
+		"3. Wire 4k7 Ohm EOL Zone 1 & 2k2 Tamper Resistors",
+		"4. Close Polycarbonate Lid & Run PIR Walk-Test"
+	],
+	"Bell": [
+		"1. Disable Hold-Off Tamper & Open Weatherproof Cover",
+		"2. Replace Corroded 115dB Twin Piezo Siren Module",
+		"3. Connect Strobe Trigger (-STB) & 0V Hold-Off Supply",
+		"4. Seal Hex Cover & Verify Alternating Comfort LEDs"
+	],
+	"CCTV": [
+		"1. Drill Masonry Wall Entry & Mount IP67 Junction Box",
+		"2. Crimp RJ45 Cat6 Connector (T568B PoE Standard)",
+		"3. Twist Waterproof Gland & Aim 2.8mm ColorVu Turret Lens",
+		"4. Enable 4K Hik-Connect Stream & Verify IR Night Ring"
+	]
+}
+
+func _ready() -> void:
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	build_hud()
+	build_minigame_ui()
+
+func build_hud() -> void:
+	var canvas = CanvasLayer.new()
+	canvas.name = "HUDCanvas"
+	add_child(canvas)
+	
+	var reticle = ColorRect.new()
+	reticle.size = Vector2(6, 6)
+	reticle.color = Color("ff6b00")
+	reticle.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	reticle.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	canvas.add_child(reticle)
+	
+	hud_label = Label.new()
+	hud_label.position = Vector2(20, 14)
+	hud_label.add_theme_font_size_override("font_size", 20)
+	hud_label.add_theme_color_override("font_color", Color("38bdf8"))
+	canvas.add_child(hud_label)
+	
+	stock_label = Label.new()
+	stock_label.position = Vector2(20, 44)
+	stock_label.add_theme_font_size_override("font_size", 17)
+	stock_label.add_theme_color_override("font_color", Color("cbd5e1"))
+	canvas.add_child(stock_label)
+	
+	prompt_label = Label.new()
+	prompt_label.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	prompt_label.position.y += 45
+	prompt_label.position.x -= 220
+	prompt_label.add_theme_font_size_override("font_size", 21)
+	prompt_label.add_theme_color_override("font_color", Color("fde047"))
+	canvas.add_child(prompt_label)
+	
+	toast_label = Label.new()
+	toast_label.position = Vector2(20, 76)
+	toast_label.add_theme_font_size_override("font_size", 18)
+	toast_label.add_theme_color_override("font_color", Color("86efac"))
+	canvas.add_child(toast_label)
+	update_hud()
+
+func build_minigame_ui() -> void:
+	var canvas = get_node("HUDCanvas")
+	minigame_panel = Panel.new()
+	minigame_panel.size = Vector2(560, 350)
+	minigame_panel.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	minigame_panel.position -= Vector2(280, 175)
+	minigame_panel.visible = false
+	canvas.add_child(minigame_panel)
+	
+	mg_title = Label.new()
+	mg_title.position = Vector2(20, 16)
+	mg_title.add_theme_font_size_override("font_size", 19)
+	mg_title.add_theme_color_override("font_color", Color("ff6b00"))
+	minigame_panel.add_child(mg_title)
+	
+	mg_status = Label.new()
+	mg_status.position = Vector2(20, 48)
+	mg_status.add_theme_font_size_override("font_size", 16)
+	mg_status.add_theme_color_override("font_color", Color("fde047"))
+	minigame_panel.add_child(mg_status)
+	
+	for i in range(4):
+		var btn = Button.new()
+		btn.size = Vector2(520, 46)
+		btn.position = Vector2(20, 88 + i * 54)
+		var step_idx = i
+		btn.pressed.connect(func(): _on_mg_button_pressed(step_idx, btn))
+		minigame_panel.add_child(btn)
+		mg_buttons.append(btn)
+
+func open_job_minigame(house_num: int, job_key: String, title_text: String, status_mesh: MeshInstance3D = null) -> void:
+	in_minigame = true
+	mg_step = 0
+	mg_house_num = house_num
+	mg_job_key = job_key
+	mg_status_mesh = status_mesh
+	mg_title.text = "🛠️ " + title_text
+	mg_status.text = "Complete the 4 NSI Gold trade steps in sequence..."
+	var custom_steps = job_step_texts.get(job_key, job_step_texts["Alarm"])
+	for i in range(4):
+		mg_buttons[i].text = custom_steps[i]
+		mg_buttons[i].disabled = false
+	minigame_panel.visible = true
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+
+func _on_mg_button_pressed(idx: int, btn: Button) -> void:
+	if idx == mg_step:
+		btn.disabled = true
+		mg_step += 1
+		mg_status.text = "✅ Step " + str(mg_step) + "/4 Verified OK!"
+		if mg_step >= 4:
+			minigame_panel.visible = false
+			in_minigame = false
+			on_ladder = false
+			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+			var world = get_parent()
+			if world.has_method("finish_job_payout"):
+				world.finish_job_payout(self, mg_house_num, mg_job_key, mg_status_mesh)
+	else:
+		mg_status.text = "⚡ FAULT! Complete the engineering sequence in order (1 -> 2 -> 3 -> 4)!"
+
+func update_hud() -> void:
+	if hud_label:
+		hud_label.text = "💷 £%d   |   🚨 %s" % [cash, active_job]
+	if stock_label:
+		stock_label.text = "📦 VAN STOCK:  Alarms: %d  |  Bells: %d  |  4K CCTV: %d   ([L] Lock Van  [F] Torch)" % [stock["Alarm"], stock["Bell"], stock["CCTV"]]
+
+func show_toast(msg: String) -> void:
+	if toast_label:
+		toast_label.text = msg
+
+func _unhandled_input(event: InputEvent) -> void:
+	if in_minigame:
+		if event.is_action_pressed("ui_cancel"):
+			minigame_panel.visible = false
+			in_minigame = false
+			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+		return
+
+	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
+		rotate_y(-event.relative.x * MOUSE_SENSITIVITY)
+		head.rotate_x(-event.relative.y * MOUSE_SENSITIVITY)
+		head.rotation.x = clamp(head.rotation.x, deg_to_rad(-85), deg_to_rad(85))
+	
+	if event.is_action_pressed("ui_cancel"):
+		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	elif event is InputEventMouseButton and event.pressed:
+		if Input.get_mouse_mode() == Input.MOUSE_MODE_VISIBLE:
+			Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+	if event.is_action_pressed("torch"):
+		head_torch.visible = !head_torch.visible
+
+	if event is InputEventKey and event.pressed and not event.echo:
+		var world = get_parent()
+		if event.keycode == KEY_L and not in_van and world.has_method("toggle_van_lock"):
+			world.toggle_van_lock(self)
+		elif event.keycode == KEY_H and in_van and world.has_method("toggle_van_headlights"):
+			var on_state = world.toggle_van_headlights()
+			show_toast("💡 Van High-Beam Headlights: " + ("ON" if on_state else "OFF"))
+
+func _physics_process(delta: float) -> void:
+	if interact_cooldown > 0.0:
+		interact_cooldown -= delta
+
+	if in_minigame:
+		prompt_label.text = ""
+		return
+
+	var e_or_click = Input.is_action_just_pressed("interact") or Input.is_physical_key_pressed(KEY_E) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+
+	if in_van:
+		prompt_label.text = "[W/S] Drive & Reverse  |  [A/D] Steer  |  [H] Headlights  |  [E] Exit Van"
+		if e_or_click and interact_cooldown <= 0.0 and current_van:
+			interact_cooldown = 0.4
+			current_van.exit_van()
+		return
+
+	var world = get_parent()
+	if world and world.has_method("get_closest_interaction"):
+		active_item = world.get_closest_interaction(global_position)
+	else:
+		active_item = {}
+
+	if on_ladder:
+		var top_prompt = " | [E] Service High Unit" if not active_item.is_empty() else ""
+		prompt_label.text = "🪜 ON LADDER (%.1fm): [W/S] Climb Up/Down | [Space] Step Off%s" % [global_position.y, top_prompt]
+		if e_or_click and interact_cooldown <= 0.0 and not active_item.is_empty():
+			interact_cooldown = 0.4
+			world.trigger_interaction(self, active_item)
+	elif not active_item.is_empty():
+		prompt_label.text = "[E / Click] " + str(active_item["prompt"])
+		if e_or_click and interact_cooldown <= 0.0:
+			interact_cooldown = 0.4
+			world.trigger_interaction(self, active_item)
+	else:
+		prompt_label.text = ""
+
+	var input_dir = Input.get_vector("move_left", "move_right", "move_forward", "move_back")
+	
+	if on_ladder:
+		velocity.x = 0
+		velocity.z = 0
+		velocity.y = -input_dir.y * CLIMB_SPEED
+		if Input.is_action_just_pressed("jump") or global_position.y < 1.3:
+			on_ladder = false
+			global_position.y = 1.5
+		move_and_slide()
+		global_position.y = clamp(global_position.y, 1.2, 4.6)
+		return
+
+	if not is_on_floor():
+		velocity.y -= gravity * delta
+
+	if Input.is_action_just_pressed("jump") and is_on_floor():
+		velocity.y = JUMP_VELOCITY
+
+	var speed = (SPRINT_SPEED if Input.is_action_pressed("sprint") else WALK_SPEED) * speed_boost
+	var direction = (transform.basis * Vector3(input_dir.x, 0, input_dir.y)).normalized()
+	
+	if direction:
+		velocity.x = direction.x * speed
+		velocity.z = direction.z * speed
+	else:
+		velocity.x = move_toward(velocity.x, 0, speed)
+		velocity.z = move_toward(velocity.z, 0, speed)
+
+	move_and_slide()
